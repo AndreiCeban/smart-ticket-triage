@@ -7,6 +7,7 @@ namespace Tests\Feature;
 use App\Jobs\ClassifyTicket;
 use App\Models\Ticket;
 use App\Services\TicketClassifier;
+use App\Services\OpenAIRateLimiter;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Queue;
 use Tests\TestCase;
@@ -118,5 +119,46 @@ class TicketClassificationTest extends TestCase
         $ticket->refresh();
         $this->assertEquals('billing', $ticket->category);
         $this->assertTrue($ticket->manually_categorized);
+    }
+
+    public function test_classification_respects_rate_limiting(): void
+    {
+        $ticket = Ticket::factory()->create([
+            'category' => null,
+            'manually_categorized' => false,
+        ]);
+
+        // Create a rate limiter with very low limit for testing
+        $rateLimiter = new OpenAIRateLimiter(1, 1);
+        $classifier = new TicketClassifier($rateLimiter);
+
+        // First classification should work
+        $result1 = $classifier->classify($ticket);
+        $this->assertIsArray($result1);
+        $this->assertArrayHasKey('category', $result1);
+
+        // Second classification should be rate limited and return fallback
+        $result2 = $classifier->classify($ticket);
+        $this->assertIsArray($result2);
+        $this->assertArrayHasKey('category', $result2);
+        $this->assertEquals('Auto-classified (AI disabled)', $result2['explanation']);
+    }
+
+    public function test_rate_limiter_prevents_api_exhaustion(): void
+    {
+        $rateLimiter = new OpenAIRateLimiter(2, 1);
+
+        // Should allow 2 requests
+        $this->assertTrue($rateLimiter->canMakeRequest());
+        $rateLimiter->attempt(fn() => true);
+        
+        $this->assertTrue($rateLimiter->canMakeRequest());
+        $rateLimiter->attempt(fn() => true);
+
+        // Third request should be blocked
+        $this->assertFalse($rateLimiter->canMakeRequest());
+        
+        $result = $rateLimiter->attempt(fn() => true);
+        $this->assertFalse($result);
     }
 }

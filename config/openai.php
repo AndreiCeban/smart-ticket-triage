@@ -46,4 +46,16 @@ return [
     */
 
     'request_timeout' => env('OPENAI_REQUEST_TIMEOUT', 30),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Rate Limiting Configuration
+    |--------------------------------------------------------------------------
+    |
+    | Configure rate limiting for OpenAI API calls to prevent quota exhaustion.
+    | These settings control how many requests can be made per time window.
+    |
+    */
+    'rate_limit' => env('OPENAI_RATE_LIMIT', 30), // requests per minute
+    'decay_minutes' => env('OPENAI_DECAY_MINUTES', 1), // time window in minutes
 ];

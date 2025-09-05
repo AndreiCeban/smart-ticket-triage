@@ -20,51 +20,79 @@ use OpenAI\Laravel\Facades\OpenAI;
 
 class TicketClassifier
 {
+    public function __construct(
+        private OpenAIRateLimiter $rateLimiter = new OpenAIRateLimiter()
+    ) {}
+
     public function classify(Ticket $ticket): array
     {
         if (!config('app.openai_classify_enabled', env('OPENAI_CLASSIFY_ENABLED', true))) {
             return $this->getFakeClassification();
         }
 
-        try {
-            $response = OpenAI::chat()->create([
-                'model' => config('openai.model', 'gpt-3.5-turbo'),
-                'messages' => [
-                    [
-                        'role' => 'system',
-                        'content' => $this->getSystemPrompt(),
-                    ],
-                    [
-                        'role' => 'user',
-                        'content' => "Subject: {$ticket->subject}\n\nBody: {$ticket->body}",
-                    ],
-                ],
-                'max_tokens' => 200,
-                'temperature' => 0.1,
+        // Check rate limit before making API call
+        if (!$this->rateLimiter->canMakeRequest()) {
+            Log::warning('OpenAI API rate limit exceeded, using fallback classification', [
+                'ticket_id' => $ticket->id,
+                'rate_limit_status' => $this->rateLimiter->getStatus(),
             ]);
-
-            $content = $response->choices[0]->message->content ?? '';
             
-            if (empty($content)) {
-                throw new \Exception('Empty response from OpenAI');
+            return $this->getFakeClassification();
+        }
+
+        try {
+            $result = $this->rateLimiter->attempt(function () use ($ticket) {
+                $response = OpenAI::chat()->create([
+                    'model' => config('openai.model', 'gpt-3.5-turbo'),
+                    'messages' => [
+                        [
+                            'role' => 'system',
+                            'content' => $this->getSystemPrompt(),
+                        ],
+                        [
+                            'role' => 'user',
+                            'content' => "Subject: {$ticket->subject}\n\nBody: {$ticket->body}",
+                        ],
+                    ],
+                    'max_tokens' => 200,
+                    'temperature' => 0.1,
+                ]);
+
+                $content = $response->choices[0]->message->content ?? '';
+                
+                if (empty($content)) {
+                    throw new \Exception('Empty response from OpenAI');
+                }
+
+                $result = json_decode($content, true);
+
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    throw new \Exception('Invalid JSON response from OpenAI: ' . json_last_error_msg());
+                }
+
+                if (!$this->isValidClassification($result)) {
+                    throw new \Exception('Classification result missing required fields');
+                }
+
+                return $this->normalizeClassification($result);
+            });
+
+            if ($result === false) {
+                Log::warning('OpenAI API call was rate limited, using fallback classification', [
+                    'ticket_id' => $ticket->id,
+                    'rate_limit_status' => $this->rateLimiter->getStatus(),
+                ]);
+                
+                return $this->getFakeClassification();
             }
 
-            $result = json_decode($content, true);
-
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                throw new \Exception('Invalid JSON response from OpenAI: ' . json_last_error_msg());
-            }
-
-            if (!$this->isValidClassification($result)) {
-                throw new \Exception('Classification result missing required fields');
-            }
-
-            return $this->normalizeClassification($result);
+            return $result;
         } catch (\Exception $e) {
             Log::error('OpenAI classification failed', [
                 'ticket_id' => $ticket->id,
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
+                'rate_limit_status' => $this->rateLimiter->getStatus(),
             ]);
 
             return $this->getFakeClassification();

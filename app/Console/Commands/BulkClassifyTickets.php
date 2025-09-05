@@ -15,6 +15,7 @@ namespace App\Console\Commands;
 
 use App\Jobs\ClassifyTicket;
 use App\Models\Ticket;
+use App\Services\OpenAIRateLimiter;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -26,7 +27,7 @@ class BulkClassifyTickets extends Command
      */
     protected $signature = 'tickets:bulk-classify
                             {--batch-size=10 : Number of tickets to process in each batch}
-                            {--rate-limit=60 : Maximum API calls per minute}
+                            {--rate-limit=30 : Maximum API calls per minute}
                             {--delay=1 : Delay between batches in seconds}
                             {--force : Force classification of already classified tickets}
                             {--dry-run : Show what would be processed without actually doing it}';
@@ -36,8 +37,7 @@ class BulkClassifyTickets extends Command
      */
     protected $description = 'Bulk classify tickets with rate limiting to prevent API quota exhaustion';
 
-    private const CACHE_KEY = 'bulk_classify_rate_limit';
-    private int $rateLimitPerMinute;
+    private OpenAIRateLimiter $rateLimiter;
     private int $batchSize;
     private int $delaySeconds;
     private bool $force;
@@ -62,7 +62,7 @@ class BulkClassifyTickets extends Command
         }
 
         $this->info("Found {$tickets->count()} tickets to classify.");
-        $this->info("Rate limit: {$this->rateLimitPerMinute} calls/minute");
+        $this->info("Rate limit: {$this->rateLimiter->getRateLimit()} calls/minute");
         $this->info("Batch size: {$this->batchSize}");
         $this->info("Delay between batches: {$this->delaySeconds} seconds");
         
@@ -77,7 +77,8 @@ class BulkClassifyTickets extends Command
     private function initializeOptions(): void
     {
         $this->batchSize = max(1, (int) $this->option('batch-size'));
-        $this->rateLimitPerMinute = max(1, (int) $this->option('rate-limit'));
+        $rateLimit = max(1, (int) $this->option('rate-limit'));
+        $this->rateLimiter = OpenAIRateLimiter::withLimits($rateLimit, 1);
         $this->delaySeconds = max(0, (int) $this->option('delay'));
         $this->force = (bool) $this->option('force');
         $this->dryRun = (bool) $this->option('dry-run');
@@ -107,7 +108,7 @@ class BulkClassifyTickets extends Command
         $batches = $tickets->chunk($this->batchSize);
         $totalBatches = $batches->count();
         $estimatedTime = (int) (($totalBatches * $this->delaySeconds) + 
-                        ceil($tickets->count() / $this->rateLimitPerMinute * 60));
+                        ceil($tickets->count() / $this->rateLimiter->getRateLimit() * 60));
         
         $this->table(
             ['Metric', 'Value'],
@@ -115,7 +116,7 @@ class BulkClassifyTickets extends Command
                 ['Total tickets', $tickets->count()],
                 ['Batch size', $this->batchSize],
                 ['Number of batches', $totalBatches],
-                ['Rate limit', "{$this->rateLimitPerMinute}/minute"],
+                ['Rate limit', "{$this->rateLimiter->getRateLimit()}/minute"],
                 ['Delay between batches', "{$this->delaySeconds}s"],
                 ['Estimated time', $this->formatDuration($estimatedTime)],
             ]
@@ -147,16 +148,29 @@ class BulkClassifyTickets extends Command
         $errors = 0;
 
         foreach ($batches as $batchIndex => $batch) {
-            if (!$this->checkRateLimit($batch->count())) {
+            // Check if we can process this batch without exceeding rate limits
+            if (!$this->rateLimiter->canMakeRequest()) {
                 $this->newLine(2);
-                $this->warn('Rate limit would be exceeded. Waiting...');
-                $this->waitForRateLimit();
+                $this->warn('Rate limit exceeded. Waiting...');
+                $waitTime = $this->rateLimiter->availableIn();
+                $this->info("Waiting {$waitTime} seconds before continuing...");
+                sleep($waitTime);
             }
 
             foreach ($batch as $ticket) {
                 try {
-                    $this->dispatchClassificationJob($ticket);
-                    $this->incrementRateLimit();
+                    // Use rate limiter to control API calls
+                    $result = $this->rateLimiter->attempt(function () use ($ticket) {
+                        $this->dispatchClassificationJob($ticket);
+                        return true;
+                    });
+
+                    if ($result === false) {
+                        $this->warn("Rate limited while processing ticket {$ticket->id}, using fallback");
+                        // Still dispatch the job, but it will use fallback classification
+                        $this->dispatchClassificationJob($ticket);
+                    }
+                    
                     $processed++;
                 } catch (\Exception $e) {
                     $errors++;
@@ -188,35 +202,6 @@ class BulkClassifyTickets extends Command
         return Command::SUCCESS;
     }
 
-    private function checkRateLimit(int $requestCount): bool
-    {
-        $currentCount = Cache::get(self::CACHE_KEY, 0);
-        return ($currentCount + $requestCount) <= $this->rateLimitPerMinute;
-    }
-
-    private function incrementRateLimit(): void
-    {
-        $currentCount = Cache::get(self::CACHE_KEY, 0);
-        Cache::put(self::CACHE_KEY, $currentCount + 1, now()->addMinute());
-    }
-
-    private function waitForRateLimit(): void
-    {
-        $waitTime = 60; // Wait for the rate limit window to reset
-        $this->info("Waiting {$waitTime} seconds for rate limit to reset...");
-        
-        $progressBar = $this->output->createProgressBar($waitTime);
-        for ($i = 0; $i < $waitTime; $i++) {
-            sleep(1);
-            $progressBar->advance();
-        }
-        
-        $progressBar->finish();
-        $this->newLine();
-        
-        // Clear the rate limit cache
-        Cache::forget(self::CACHE_KEY);
-    }
 
     private function dispatchClassificationJob(Ticket $ticket): void
     {

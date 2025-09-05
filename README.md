@@ -85,7 +85,18 @@ Edit `.env`:
 ```env
 OPENAI_API_KEY=your_api_key_here
 OPENAI_CLASSIFY_ENABLED=true
+OPENAI_RATE_LIMIT=30
+OPENAI_DECAY_MINUTES=1
 ```
+
+### Rate Limiting
+The application includes professional rate limiting to prevent OpenAI API quota exhaustion:
+
+- **Configurable Limits**: Set `OPENAI_RATE_LIMIT` (default: 30 requests/minute)
+- **Time Windows**: Configure `OPENAI_DECAY_MINUTES` (default: 1 minute)
+- **Exponential Backoff**: Automatic retry delays when limits are exceeded
+- **Fallback Classification**: Uses random categories when rate limited
+- **Bulk Processing**: Smart batching in `tickets:bulk-classify` command
 
 ### Classification Categories
 - `technical` - Technical Support
